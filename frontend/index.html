@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SiteBuilder</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="sb-topbar">
+  <div class="sb-topbar-left">
+    <span class="sb-brand">SiteBuilder</span>
+    <input type="text" id="projectName" class="sb-input" value="Sans titre" aria-label="Nom du projet">
+  </div>
+  <div class="sb-topbar-right">
+    <select id="themeSelect" class="sb-select" aria-label="Thème de design"></select>
+    <select id="loadSelect" class="sb-select" aria-label="Charger un projet sauvegardé">
+      <option value="">Charger…</option>
+    </select>
+    <button type="button" id="saveBtn" class="sb-btn">Enregistrer</button>
+    <button type="button" id="exportBtn" class="sb-btn sb-btn-accent">Exporter HTML</button>
+  </div>
+</header>
+
+<div class="sb-body">
+  <aside class="sb-palette" aria-label="Blocs disponibles">
+    <h2 class="sb-panel-title">Blocs</h2>
+    <div id="paletteList" class="sb-palette-list"></div>
+  </aside>
+
+  <main class="sb-canvas-wrap">
+    <div id="pageCanvas" class="page-canvas" aria-label="Zone de composition de la page"></div>
+    <p class="sb-canvas-hint" id="canvasHint">Glissez un bloc depuis la palette pour commencer.</p>
+  </main>
+
+  <aside class="sb-props" aria-label="Propriétés du bloc sélectionné">
+    <h2 class="sb-panel-title">Propriétés</h2>
+    <div id="propsPanel" class="sb-props-empty">Sélectionnez un bloc pour modifier ses propriétés.</div>
+  </aside>
+</div>
+
+<script src="blocks.js"></script>
+<script src="themes.js"></script>
+<script src="script.js"></script>
+</body>
+</html>

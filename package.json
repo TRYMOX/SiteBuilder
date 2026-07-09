@@ -1,0 +1,13 @@
+{
+  "name": "sitebuilder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Éditeur de pages en glisser-déposer : blocs, thèmes de design, sauvegarde et export HTML/CSS",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
