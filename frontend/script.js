@@ -175,28 +175,63 @@ const BLOCK_CATEGORIES = [
   { name: 'Interactif', types: ['button', 'accordion', 'contactForm'] },
 ];
 
-// catégories repliées (par nom) — repliable indépendamment, état gardé en
-// mémoire tant que la page n'est pas rechargée
-const collapsedCategories = new Set();
+// catégories repliées (par nom) — persisté dans localStorage pour survivre
+// à un rechargement de page (échec silencieux si localStorage indisponible,
+// ex. navigation privée : la palette reste alors dépliée par défaut)
+const PALETTE_COLLAPSED_KEY = 'sitebuilder-palette-collapsed';
+function loadCollapsedCategories() {
+  try {
+    const raw = localStorage.getItem(PALETTE_COLLAPSED_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+function saveCollapsedCategories() {
+  try {
+    localStorage.setItem(PALETTE_COLLAPSED_KEY, JSON.stringify([...collapsedCategories]));
+  } catch {
+    // localStorage indisponible (navigation privée, quota...) : le repli ne
+    // survivra pas au rechargement, tant pis, ce n'est pas bloquant
+  }
+}
+const collapsedCategories = loadCollapsedCategories();
+
+// filtre de recherche de la palette (#paletteSearch) : pendant une recherche,
+// l'état replié/déplié des catégories est ignoré (tout résultat pertinent
+// doit rester visible) et les catégories sans résultat disparaissent
+let paletteSearchQuery = '';
 
 function renderPalette() {
-  paletteListEl.innerHTML = BLOCK_CATEGORIES.map(cat => {
-    const collapsed = collapsedCategories.has(cat.name);
-    const itemsHtml = cat.types.map(type => {
+  const query = paletteSearchQuery.trim().toLowerCase();
+  const filtering = query.length > 0;
+
+  const categoriesHtml = BLOCK_CATEGORIES.map(cat => {
+    const types = filtering
+      ? cat.types.filter(type => BLOCK_DEFS[type] && BLOCK_DEFS[type].label.toLowerCase().includes(query))
+      : cat.types;
+    if (filtering && !types.length) return '';
+
+    const collapsed = !filtering && collapsedCategories.has(cat.name);
+    const itemsHtml = types.map(type => {
       const def = BLOCK_DEFS[type];
       if (!def) return '';
       return `<div class="palette-item" draggable="true" data-type="${type}"><span class="palette-item-icon">${escapeHtml(def.icon)}</span>${escapeHtml(def.label)}</div>`;
     }).join('');
     return `
       <div class="palette-category">
-        <button type="button" class="palette-category-header" data-cat="${escapeHtml(cat.name)}">
+        <button type="button" class="palette-category-header" data-cat="${escapeHtml(cat.name)}" aria-expanded="${!collapsed}">
           <span class="palette-category-arrow${collapsed ? ' collapsed' : ''}">▾</span>
           ${escapeHtml(cat.name)}
         </button>
-        <div class="palette-category-items"${collapsed ? ' hidden' : ''}>${itemsHtml}</div>
+        <div class="palette-category-items${collapsed ? ' collapsed' : ''}">${itemsHtml}</div>
       </div>
     `;
   }).join('');
+
+  paletteListEl.innerHTML = categoriesHtml.trim()
+    ? categoriesHtml
+    : '<p class="palette-empty">Aucun bloc trouvé.</p>';
 
   paletteListEl.querySelectorAll('.palette-item').forEach(item => {
     item.addEventListener('dragstart', (e) => {
@@ -208,6 +243,7 @@ function renderPalette() {
     header.addEventListener('click', () => {
       const cat = header.dataset.cat;
       if (collapsedCategories.has(cat)) collapsedCategories.delete(cat); else collapsedCategories.add(cat);
+      saveCollapsedCategories();
       renderPalette();
     });
   });
@@ -1482,6 +1518,16 @@ function injectPageCss() {
   const style = document.createElement('style');
   style.textContent = PAGE_CSS;
   document.head.appendChild(style);
+}
+
+const paletteSearchEl = document.getElementById('paletteSearch');
+if (paletteSearchEl) {
+  paletteSearchEl.addEventListener('input', () => {
+    paletteSearchQuery = paletteSearchEl.value;
+    renderPalette();
+  });
+} else {
+  console.error('élément introuvable : paletteSearch');
 }
 
 function init() {
