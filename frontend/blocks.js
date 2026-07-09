@@ -117,6 +117,13 @@ const SHADOW_PRESETS = {
 };
 const SHADOW_LABELS = { none: 'Aucune', sm: 'Légère', md: 'Moyenne', lg: 'Prononcée' };
 
+// clonage profond de blocs — tous les champs sont des types sérialisables en
+// JSON (string/number/boolean/null/tableau de strings), donc suffisant pour
+// dupliquer un bloc ou prendre un instantané pour l'historique annuler/rétablir
+function cloneBlocks(blocks) {
+  return JSON.parse(JSON.stringify(blocks));
+}
+
 function createBlock(type) {
   const def = BLOCK_DEFS[type];
   // x/y (position libre en px sur le canevas), width/height (px, height

@@ -1,5 +1,40 @@
 let state = { name: 'Sans titre', theme: THEMES[0].id, blocks: [], selectedId: null };
 
+// historique annuler/rétablir : pile d'instantanés complets de state.blocks
+// (voir pushHistory/undo/redo) — plus simple et plus robuste qu'un suivi
+// mutation par mutation, et couvre automatiquement tout futur champ de bloc
+let historyStack = [];
+let historyIndex = -1;
+let restoringHistory = false;
+// vrai pendant un glisser (déplacement/redimensionnement) : bloque les
+// raccourcis clavier pour éviter toute interférence avec le geste en cours
+let gestureActive = false;
+// presse-papiers interne (copier/couper/coller de blocs) — pasteCount permet
+// à des collages répétés de décaler chaque copie plutôt que de les empiler
+// exactement au même endroit
+let clipboardBlock = null;
+let pasteCount = 0;
+
+const HISTORY_LIMIT = 50;
+const DUPLICATE_OFFSET = 20;
+const SNAP_THRESHOLD = 6;
+const NUDGE_STEP = 1;
+const NUDGE_STEP_SHIFT = 10;
+
+// liste affichée dans le panneau "Raccourcis" (bouton de la barre du haut)
+const SHORTCUTS = [
+  ['Ctrl+Z', 'Annuler'],
+  ['Ctrl+Y / Ctrl+Maj+Z', 'Rétablir'],
+  ['Ctrl+C', 'Copier le bloc sélectionné'],
+  ['Ctrl+X', 'Couper le bloc sélectionné'],
+  ['Ctrl+V', 'Coller'],
+  ['Ctrl+D', 'Dupliquer le bloc sélectionné'],
+  ['Suppr / Retour arrière', 'Supprimer le bloc sélectionné'],
+  ['Flèches', 'Déplacer le bloc sélectionné (1px)'],
+  ['Maj + Flèches', 'Déplacer le bloc sélectionné (10px)'],
+  ['Échap', 'Désélectionner / fermer ce panneau'],
+];
+
 const canvasEl = document.getElementById('pageCanvas');
 const paletteListEl = document.getElementById('paletteList');
 const propsPanelEl = document.getElementById('propsPanel');
@@ -107,6 +142,7 @@ function renderCanvas() {
     <div class="block-wrapper${block.id === state.selectedId ? ' selected' : ''}${block.locked ? ' locked' : ''}" data-id="${block.id}">
       <div class="block-controls">
         <button type="button" class="block-control-btn${block.locked ? ' locked' : ''}" data-action="lock" title="${block.locked ? 'Déverrouiller' : 'Verrouiller'}">L</button>
+        <button type="button" class="block-control-btn" data-action="duplicate" title="Dupliquer (Ctrl+D)">⧉</button>
         <button type="button" class="block-control-btn" data-action="delete" title="Supprimer">×</button>
       </div>
       <div class="selection-frame"></div>
@@ -139,6 +175,10 @@ function renderCanvas() {
       e.stopPropagation();
       toggleLock(id);
     });
+    wrapper.querySelector('[data-action="duplicate"]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      duplicateBlock(id);
+    });
     wrapper.querySelectorAll('.resize-handle').forEach(handle => {
       handle.addEventListener('mousedown', (e) => startResize(e, id, handle.dataset.dir));
     });
@@ -146,6 +186,7 @@ function renderCanvas() {
   });
 
   updateCanvasHeight();
+  ensureSnapGuides();
 }
 
 // aligne le cadre de sélection, les poignées et le bouton de suppression sur
@@ -193,6 +234,7 @@ function startMove(e, id) {
   const block = findBlock(id);
   if (block.locked) { selectBlock(id); return; }
   e.preventDefault();
+  gestureActive = true;
   selectBlock(id);
   const wrapper = canvasEl.querySelector(`.block-wrapper[data-id="${id}"]`);
   const content = wrapper.querySelector('.blk-resizable');
@@ -200,19 +242,41 @@ function startMove(e, id) {
   const startY = e.clientY;
   const startLeft = block.x;
   const startTop = block.y;
+  // cibles d'aimantation calculées une seule fois au début du geste (les
+  // autres blocs ne bougent pas pendant qu'on déplace celui-ci)
+  const snapTargets = computeSnapTargets(id);
 
   function onMove(ev) {
-    block.x = Math.max(0, startLeft + (ev.clientX - startX));
-    block.y = Math.max(0, startTop + (ev.clientY - startY));
+    const candX = Math.max(0, startLeft + (ev.clientX - startX));
+    const candY = Math.max(0, startTop + (ev.clientY - startY));
+    const width = block.width || 400;
+    const height = content.offsetHeight;
+
+    const xMatch = bestSnapMatch(
+      [['left', candX], ['center', candX + width / 2], ['right', candX + width]],
+      snapTargets.xs, SNAP_THRESHOLD
+    );
+    block.x = Math.max(0, xMatch ? candX + (xMatch.target - xMatch.value) : candX);
+
+    const yMatch = bestSnapMatch(
+      [['top', candY], ['center', candY + height / 2], ['bottom', candY + height]],
+      snapTargets.ys, SNAP_THRESHOLD
+    );
+    block.y = Math.max(0, yMatch ? candY + (yMatch.target - yMatch.value) : candY);
+
     content.style.left = block.x + 'px';
     content.style.top = block.y + 'px';
     positionOverlays(wrapper);
     updateCanvasHeight();
+    updateSnapGuides(xMatch ? xMatch.target : null, yMatch ? yMatch.target : null);
   }
 
   function onUp() {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
+    hideSnapGuides();
+    gestureActive = false;
+    pushHistory();
   }
 
   document.addEventListener('mousemove', onMove);
@@ -225,6 +289,7 @@ function startMove(e, id) {
 function startResize(e, id, dir) {
   e.preventDefault();
   e.stopPropagation();
+  gestureActive = true;
   const block = findBlock(id);
   const wrapper = canvasEl.querySelector(`.block-wrapper[data-id="${id}"]`);
   const content = wrapper.querySelector('.blk-resizable');
@@ -234,20 +299,36 @@ function startResize(e, id, dir) {
   const startHeight = block.height || content.getBoundingClientRect().height;
   const startLeft = block.x;
   const startTop = block.y;
+  // un seul bord bouge par poignée, pas besoin de comparer gauche/centre/droite
+  const snapTargets = computeSnapTargets(id);
 
   function onMove(ev) {
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
     if (dir === 'right') {
-      block.width = Math.max(40, Math.round(startWidth + dx));
+      const rightEdge = startLeft + Math.max(40, Math.round(startWidth + dx));
+      const snapped = findSnap(rightEdge, snapTargets.xs, SNAP_THRESHOLD);
+      block.width = Math.max(40, (snapped ?? rightEdge) - block.x);
+      updateSnapGuides(snapped, null);
     } else if (dir === 'left') {
-      block.width = Math.max(40, Math.round(startWidth - dx));
-      block.x = Math.max(0, Math.round(startLeft + dx));
+      const rawLeft = Math.max(0, Math.round(startLeft + dx));
+      const snapped = findSnap(rawLeft, snapTargets.xs, SNAP_THRESHOLD);
+      const finalLeft = snapped ?? rawLeft;
+      block.width = Math.max(40, (startLeft + startWidth) - finalLeft);
+      block.x = finalLeft;
+      updateSnapGuides(snapped, null);
     } else if (dir === 'bottom') {
-      block.height = Math.max(20, Math.round(startHeight + dy));
+      const bottomEdge = startTop + Math.max(20, Math.round(startHeight + dy));
+      const snapped = findSnap(bottomEdge, snapTargets.ys, SNAP_THRESHOLD);
+      block.height = Math.max(20, (snapped ?? bottomEdge) - block.y);
+      updateSnapGuides(null, snapped);
     } else if (dir === 'top') {
-      block.height = Math.max(20, Math.round(startHeight - dy));
-      block.y = Math.max(0, Math.round(startTop + dy));
+      const rawTop = Math.max(0, Math.round(startTop + dy));
+      const snapped = findSnap(rawTop, snapTargets.ys, SNAP_THRESHOLD);
+      const finalTop = snapped ?? rawTop;
+      block.height = Math.max(20, (startTop + startHeight) - finalTop);
+      block.y = finalTop;
+      updateSnapGuides(null, snapped);
     }
     updateBlockDom(id);
     syncSizeFields(block);
@@ -256,6 +337,9 @@ function startResize(e, id, dir) {
   function onUp() {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
+    hideSnapGuides();
+    gestureActive = false;
+    pushHistory();
   }
 
   document.addEventListener('mousemove', onMove);
@@ -265,6 +349,55 @@ function startResize(e, id, dir) {
 function toggleLock(id) {
   const block = findBlock(id);
   block.locked = !block.locked;
+  pushHistory();
+  render();
+}
+
+// copie un bloc (tous ses réglages) juste après l'original dans state.blocks
+// — pas en fin de tableau, sinon il saute visuellement au-dessus de tous les
+// autres blocs (l'ordre du tableau pilote l'empilement, voir bringToFront)
+function duplicateBlock(id) {
+  const block = findBlock(id);
+  if (!block) return;
+  const [copy] = cloneBlocks([block]);
+  copy.id = makeBlockId();
+  copy.x = Math.max(0, block.x + DUPLICATE_OFFSET);
+  copy.y = Math.max(0, block.y + DUPLICATE_OFFSET);
+  const idx = state.blocks.findIndex(b => b.id === id);
+  state.blocks.splice(idx + 1, 0, copy);
+  state.selectedId = copy.id;
+  pushHistory();
+  render();
+}
+
+// ---------- Copier / Couper / Coller ----------
+
+function copySelected() {
+  if (!state.selectedId) return;
+  const block = findBlock(state.selectedId);
+  if (!block) return;
+  clipboardBlock = cloneBlocks([block])[0];
+  pasteCount = 0;
+}
+
+function cutSelected() {
+  if (!state.selectedId) return;
+  copySelected();
+  deleteBlock(state.selectedId);
+}
+
+// colle le bloc copié, décalé un peu plus à chaque collage successif
+// (cascade) plutôt que de toujours superposer la copie au même endroit
+function pasteClipboard() {
+  if (!clipboardBlock) return;
+  pasteCount++;
+  const [copy] = cloneBlocks([clipboardBlock]);
+  copy.id = makeBlockId();
+  copy.x = Math.max(0, clipboardBlock.x + DUPLICATE_OFFSET * pasteCount);
+  copy.y = Math.max(0, clipboardBlock.y + DUPLICATE_OFFSET * pasteCount);
+  state.blocks.push(copy);
+  state.selectedId = copy.id;
+  pushHistory();
   render();
 }
 
@@ -278,6 +411,7 @@ function handleDrop(e) {
   block.y = Math.max(0, Math.round(e.clientY - rect.top - 20));
   state.blocks.push(block);
   state.selectedId = block.id;
+  pushHistory();
   render();
 }
 
@@ -307,6 +441,7 @@ function selectBlock(id) {
 function deleteBlock(id) {
   state.blocks = state.blocks.filter(b => b.id !== id);
   if (state.selectedId === id) state.selectedId = null;
+  pushHistory();
   render();
 }
 
@@ -347,11 +482,16 @@ function renderProps() {
   // chaque liaison est indépendante (élément absent ou erreur ponctuelle
   // ignorés individuellement) pour qu'un seul champ défaillant ne bloque
   // jamais la liaison des autres champs du panneau
+  // les champs à validation immédiate (select/checkbox, événement "change")
+  // poussent un instantané dès la validation ; les champs à frappe continue
+  // (texte/nombre/couleur, événement "input") ne poussent qu'au blur, sinon
+  // chaque touche créerait sa propre entrée d'historique (Ctrl+Z ne devrait
+  // annuler qu'une modification complète, pas caractère par caractère)
   schema.forEach(field => {
     const input = document.getElementById(`prop-${field.key}`);
     if (!input) { console.error(`champ de propriété introuvable : prop-${field.key}`); return; }
-    const evtName = field.type === 'text' || field.type === 'textarea' || field.type === 'list-items' ? 'input' : 'change';
-    input.addEventListener(evtName, () => {
+    const isContinuous = field.type === 'text' || field.type === 'textarea' || field.type === 'list-items';
+    input.addEventListener(isContinuous ? 'input' : 'change', () => {
       try {
         if (field.type === 'list-items') {
           block[field.key] = input.value.split('\n');
@@ -359,10 +499,12 @@ function renderProps() {
           block[field.key] = field.numeric ? Number(input.value) : input.value;
         }
         updateBlockDom(block.id);
+        if (!isContinuous) pushHistory();
       } catch (err) {
         console.error(`échec de mise à jour du champ ${field.key} :`, err);
       }
     });
+    if (isContinuous) input.addEventListener('blur', () => pushHistory());
   });
 
   bindOptionalColor(block, 'bgColor');
@@ -376,6 +518,7 @@ function renderProps() {
     shadowSelect.addEventListener('change', () => {
       block.shadow = shadowSelect.value;
       updateBlockDom(block.id);
+      pushHistory();
     });
   }
 
@@ -386,6 +529,7 @@ function renderProps() {
   if (lockedInput) {
     lockedInput.addEventListener('change', (e) => {
       block.locked = e.target.checked;
+      pushHistory();
       render();
     });
   }
@@ -401,6 +545,7 @@ function renderProps() {
   function bindSizeField(id, apply) {
     const input = document.getElementById(id);
     if (!input) { console.error(`champ de taille introuvable : ${id}`); return; }
+    input.addEventListener('blur', () => pushHistory());
     input.addEventListener('input', (e) => {
       try {
         apply(block, e.target.value);
@@ -421,12 +566,14 @@ function renderProps() {
       colorInput.disabled = !checkbox.checked;
       b[key] = checkbox.checked ? colorInput.value : null;
       updateBlockDom(b.id);
+      pushHistory();
     });
     colorInput.addEventListener('input', () => {
       if (!checkbox.checked) return;
       b[key] = colorInput.value;
       updateBlockDom(b.id);
     });
+    colorInput.addEventListener('blur', () => pushHistory());
   }
 }
 
@@ -490,6 +637,7 @@ function bringToFront(id) {
   if (idx === -1) return;
   const [block] = state.blocks.splice(idx, 1);
   state.blocks.push(block);
+  pushHistory();
   render();
 }
 
@@ -498,6 +646,7 @@ function sendToBack(id) {
   if (idx === -1) return;
   const [block] = state.blocks.splice(idx, 1);
   state.blocks.unshift(block);
+  pushHistory();
   render();
 }
 
@@ -528,6 +677,254 @@ function renderPropField(block, field) {
   return `<div class="prop-field"><label>${escapeHtml(field.label)}</label><input type="text" id="prop-${field.key}" value="${escapeHtml(value)}"></div>`;
 }
 
+// ---------- Historique (annuler/rétablir) ----------
+
+function snapshot() {
+  return { blocks: cloneBlocks(state.blocks), selectedId: state.selectedId };
+}
+
+function initHistory() {
+  historyStack = [snapshot()];
+  historyIndex = 0;
+  updateHistoryButtons();
+}
+
+// ajoute l'état courant comme nouvelle entrée d'historique — appelé une
+// seule fois par action terminée (jamais depuis un mousemove/keydown répété,
+// voir startMove/startResize/onGlobalKeyup)
+function pushHistory() {
+  if (restoringHistory) return;
+  const entry = snapshot();
+  const last = historyStack[historyIndex];
+  // déduplique sur le contenu des blocs (pas selectedId) : un simple clic de
+  // sélection sans déplacement ne doit jamais créer d'entrée
+  if (last && JSON.stringify(last.blocks) === JSON.stringify(entry.blocks)) return;
+  historyStack.length = historyIndex + 1; // efface la branche "refaire"
+  historyStack.push(entry);
+  if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
+  historyIndex = historyStack.length - 1;
+  updateHistoryButtons();
+}
+
+function applyHistorySnapshot(entry) {
+  restoringHistory = true;
+  state.blocks = cloneBlocks(entry.blocks);
+  state.selectedId = entry.selectedId;
+  render();
+  restoringHistory = false;
+  updateHistoryButtons();
+}
+
+function undo() {
+  if (historyIndex <= 0) return;
+  historyIndex--;
+  applyHistorySnapshot(historyStack[historyIndex]);
+}
+
+function redo() {
+  if (historyIndex >= historyStack.length - 1) return;
+  historyIndex++;
+  applyHistorySnapshot(historyStack[historyIndex]);
+}
+
+function updateHistoryButtons() {
+  const undoBtn = document.getElementById('undoBtn');
+  const redoBtn = document.getElementById('redoBtn');
+  if (undoBtn) undoBtn.disabled = historyIndex <= 0;
+  if (redoBtn) redoBtn.disabled = historyIndex >= historyStack.length - 1;
+}
+
+document.getElementById('undoBtn').addEventListener('click', undo);
+document.getElementById('redoBtn').addEventListener('click', redo);
+
+// ---------- Guides d'alignement / aimantation ----------
+
+// re-crées/ré-attachées à chaque renderCanvas() : celui-ci fait
+// canvasEl.innerHTML = ..., ce qui détruirait des guides ajoutées une seule
+// fois au démarrage — jamais présentes dans state.blocks, donc jamais dans
+// l'export (qui ne lit que state.blocks)
+function ensureSnapGuides() {
+  let v = document.getElementById('snapGuideV');
+  let h = document.getElementById('snapGuideH');
+  if (!v) { v = document.createElement('div'); v.id = 'snapGuideV'; v.className = 'snap-guide snap-guide-v'; }
+  if (!h) { h = document.createElement('div'); h.id = 'snapGuideH'; h.className = 'snap-guide snap-guide-h'; }
+  canvasEl.appendChild(v);
+  canvasEl.appendChild(h);
+}
+
+function updateSnapGuides(guideX, guideY) {
+  const v = document.getElementById('snapGuideV');
+  const h = document.getElementById('snapGuideH');
+  if (v) { if (guideX != null) { v.style.left = guideX + 'px'; v.style.display = 'block'; } else v.style.display = 'none'; }
+  if (h) { if (guideY != null) { h.style.top = guideY + 'px'; h.style.display = 'block'; } else h.style.display = 'none'; }
+}
+
+function hideSnapGuides() {
+  updateSnapGuides(null, null);
+}
+
+// bords/centres de tous les autres blocs + bords/centre du canevas — calculé
+// une seule fois au début d'un geste (mousedown), pas à chaque mousemove,
+// puisque seul le bloc déplacé/redimensionné bouge pendant son propre geste
+function computeSnapTargets(excludeId) {
+  const xs = new Set([0, canvasEl.clientWidth, canvasEl.clientWidth / 2]);
+  const ys = new Set([0]);
+  canvasEl.querySelectorAll('.block-wrapper').forEach(w => {
+    if (w.dataset.id === excludeId) return;
+    const b = findBlock(w.dataset.id);
+    const content = w.querySelector('.blk-resizable');
+    if (!b || !content) return;
+    const width = b.width || 400;
+    const height = content.offsetHeight;
+    xs.add(b.x); xs.add(b.x + width); xs.add(b.x + width / 2);
+    ys.add(b.y); ys.add(b.y + height); ys.add(b.y + height / 2);
+  });
+  return { xs: [...xs], ys: [...ys] };
+}
+
+function findSnap(value, targets, threshold) {
+  let best = null, bestDist = threshold;
+  for (const t of targets) {
+    const d = Math.abs(value - t);
+    if (d <= bestDist) { bestDist = d; best = t; }
+  }
+  return best;
+}
+
+// parmi plusieurs bords candidats (gauche/centre/droite ou haut/centre/bas),
+// ne retient que le plus proche d'une cible — jamais plusieurs à la fois
+function bestSnapMatch(candidates, targets, threshold) {
+  let best = null;
+  for (const [label, value] of candidates) {
+    const t = findSnap(value, targets, threshold);
+    if (t == null) continue;
+    const dist = Math.abs(value - t);
+    if (!best || dist < best.dist) best = { label, value, target: t, dist };
+  }
+  return best;
+}
+
+// ---------- Raccourcis clavier ----------
+
+function isTypingInField() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+// remet à jour la position DOM d'un bloc + ses survols (cadre/poignées) +
+// la hauteur du canevas — partagé entre startMove.onMove et le nudge clavier
+function syncBlockPositionDom(wrapper, block) {
+  const content = wrapper.querySelector('.blk-resizable');
+  if (content) {
+    content.style.left = block.x + 'px';
+    content.style.top = block.y + 'px';
+  }
+  positionOverlays(wrapper);
+  updateCanvasHeight();
+}
+
+function onGlobalKeydown(e) {
+  if (gestureActive) return;
+  const ctrlOrCmd = e.ctrlKey || e.metaKey;
+
+  if (ctrlOrCmd && (e.key === 'z' || e.key === 'Z')) {
+    if (isTypingInField()) return; // laisse le undo natif du navigateur agir dans le champ
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'y' || e.key === 'Y')) {
+    if (isTypingInField()) return;
+    e.preventDefault();
+    redo();
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'c' || e.key === 'C')) {
+    if (isTypingInField()) return; // laisse le copier natif du navigateur agir dans le champ
+    if (state.selectedId) { e.preventDefault(); copySelected(); }
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'x' || e.key === 'X')) {
+    if (isTypingInField()) return;
+    if (state.selectedId) { e.preventDefault(); cutSelected(); }
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'v' || e.key === 'V')) {
+    if (isTypingInField()) return; // laisse le coller natif du navigateur agir dans le champ
+    if (clipboardBlock) { e.preventDefault(); pasteClipboard(); }
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'd' || e.key === 'D')) {
+    if (isTypingInField()) return;
+    if (state.selectedId) { e.preventDefault(); duplicateBlock(state.selectedId); }
+    return;
+  }
+
+  if (isTypingInField()) return;
+
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (state.selectedId) { e.preventDefault(); deleteBlock(state.selectedId); }
+    return;
+  }
+  if (e.key === 'Escape') {
+    const panel = document.getElementById('shortcutsPanel');
+    if (panel && !panel.hidden) { toggleShortcutsPanel(false); return; }
+    if (state.selectedId) selectBlock(null);
+    return;
+  }
+  if (e.key.startsWith('Arrow')) {
+    if (!state.selectedId) return;
+    const block = findBlock(state.selectedId);
+    if (!block || block.locked) return; // cohérent avec startMove qui refuse de déplacer un bloc verrouillé
+    e.preventDefault();
+    const step = e.shiftKey ? NUDGE_STEP_SHIFT : NUDGE_STEP;
+    if (e.key === 'ArrowLeft') block.x = Math.max(0, block.x - step);
+    else if (e.key === 'ArrowRight') block.x = Math.max(0, block.x + step);
+    else if (e.key === 'ArrowUp') block.y = Math.max(0, block.y - step);
+    else if (e.key === 'ArrowDown') block.y = Math.max(0, block.y + step);
+    const wrapper = canvasEl.querySelector(`.block-wrapper[data-id="${block.id}"]`);
+    if (wrapper) syncBlockPositionDom(wrapper, block);
+  }
+}
+
+function onGlobalKeyup(e) {
+  // un appui maintenu répète keydown mais keyup ne fire qu'une fois au
+  // relâchement : la pression entière ne compte que pour une seule entrée
+  // d'historique, comme un geste de glisser
+  if (e.key.startsWith('Arrow')) pushHistory();
+}
+
+document.addEventListener('keydown', onGlobalKeydown);
+document.addEventListener('keyup', onGlobalKeyup);
+
+// panneau de référence listant tous les raccourcis (bouton "Raccourcis" de
+// la barre du haut), à la manière du menu Édition de VSCode
+function renderShortcutsList() {
+  const list = document.getElementById('shortcutsList');
+  if (!list) return;
+  list.innerHTML = SHORTCUTS.map(([keys, label]) => `
+    <li><span class="shortcut-label">${escapeHtml(label)}</span><span class="shortcut-keys">${escapeHtml(keys)}</span></li>
+  `).join('');
+}
+
+function toggleShortcutsPanel(show) {
+  const panel = document.getElementById('shortcutsPanel');
+  if (!panel) return;
+  panel.hidden = show === undefined ? !panel.hidden : !show;
+}
+
+document.getElementById('shortcutsBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleShortcutsPanel();
+});
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('shortcutsPanel');
+  if (!panel || panel.hidden) return;
+  if (!panel.contains(e.target) && e.target.id !== 'shortcutsBtn') toggleShortcutsPanel(false);
+});
+
 // ---------- Thème, sauvegarde, chargement, export ----------
 
 themeSelectEl.addEventListener('change', () => {
@@ -554,6 +951,9 @@ loadSelectEl.addEventListener('change', async () => {
   projectNameEl.value = state.name;
   themeSelectEl.value = state.theme;
   render();
+  // charger un autre projet ne doit pas permettre d'annuler vers les blocs
+  // du projet précédent — historique repart de zéro sur ce nouvel état
+  initHistory();
 });
 
 document.getElementById('saveBtn').addEventListener('click', async () => {
@@ -619,8 +1019,10 @@ function init() {
   injectPageCss();
   renderPalette();
   renderThemeSelect();
+  renderShortcutsList();
   refreshLoadList();
   render();
+  initHistory();
 }
 
 init();

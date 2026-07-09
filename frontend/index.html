@@ -12,8 +12,11 @@
   <div class="sb-topbar-left">
     <span class="sb-brand">SiteBuilder</span>
     <input type="text" id="projectName" class="sb-input" value="Sans titre" aria-label="Nom du projet">
+    <button type="button" id="undoBtn" class="sb-btn sb-btn-icon" title="Annuler (Ctrl+Z)" disabled>↶</button>
+    <button type="button" id="redoBtn" class="sb-btn sb-btn-icon" title="Rétablir (Ctrl+Y)" disabled>↷</button>
   </div>
   <div class="sb-topbar-right">
+    <button type="button" id="shortcutsBtn" class="sb-btn" title="Voir les raccourcis clavier">⌨ Raccourcis</button>
     <select id="themeSelect" class="sb-select" aria-label="Thème de design"></select>
     <select id="loadSelect" class="sb-select" aria-label="Charger un projet sauvegardé">
       <option value="">Charger…</option>
@@ -22,6 +25,11 @@
     <button type="button" id="exportBtn" class="sb-btn sb-btn-accent">Exporter HTML</button>
   </div>
 </header>
+
+<div class="shortcuts-panel" id="shortcutsPanel" hidden>
+  <h3>Raccourcis clavier</h3>
+  <ul id="shortcutsList"></ul>
+</div>
 
 <div class="sb-body">
   <aside class="sb-palette" aria-label="Blocs disponibles">
