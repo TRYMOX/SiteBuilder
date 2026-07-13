@@ -394,12 +394,12 @@ body{
   gap: 10px;
 }
 
+/* largeur/max-width/min-height viennent désormais de PAGE_CSS (blocks.js),
+   seule source pour ce qui doit être identique éditeur/export — ne reste
+   ici que le chrome propre à l'éditeur (jamais dans l'export) */
 .page-canvas{
-  width: 100%;
-  max-width: 760px;
   border-radius: var(--radius-md);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
-  min-height: 400px;
 }
 
 .page-canvas.drag-over{ outline: 2px dashed var(--sb-accent); outline-offset: 4px; }

@@ -52,7 +52,7 @@ const BLOCK_DEFS = {
     icon: '▨',
     defaults: () => ({ type: 'image', src: '', alt: '', style: 'default' }),
     render: b => b.src
-      ? `<img class="blk-image blk-image-${b.style || 'default'}" src="${escapeHtml(b.src)}" alt="${escapeHtml(b.alt)}">`
+      ? `<img class="blk-image blk-image-${b.style || 'default'}" src="${escapeHtml(b.src)}" alt="${escapeHtml(b.alt)}" loading="lazy">`
       : `<div class="blk-image-empty">Aucune image (renseigner une URL dans les propriétés)</div>`,
   },
   section: {
@@ -187,7 +187,7 @@ const BLOCK_DEFS = {
     defaults: () => ({ type: 'gallery', images: [], columns: 3 }),
     render: b => {
       if (!b.images.length) return `<div class="blk-image-empty">Aucune image (ajouter des URLs dans les propriétés)</div>`;
-      const imgs = b.images.map(src => `<img src="${escapeHtml(src)}" alt="">`).join('');
+      const imgs = b.images.map(src => `<img src="${escapeHtml(src)}" alt="" loading="lazy">`).join('');
       return `<div class="blk-gallery" style="grid-template-columns:repeat(${Number(b.columns) || 3},1fr)">${imgs}</div>`;
     },
   },
@@ -343,6 +343,15 @@ const PAGE_CSS = `
   color: var(--page-text);
   font-family: var(--page-bodyFont);
   min-height: 400px;
+  /* même largeur que dans l'éditeur (voir .page-canvas dans style.css) —
+     sinon les blocs fixés (navbar/footer/sidebar, en left:0/right:0 ou
+     top:0/bottom:0) s'étirent sur toute la largeur du navigateur à l'export
+     au lieu de rester à 760px comme dans l'aperçu édité. margin:auto centre
+     la page exportée, qui n'a pas l'équivalent de .sb-canvas-wrap (flex +
+     align-items:center) de l'éditeur pour la centrer autrement */
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
 }
 .page-canvas h1.blk-heading{ font-size: 34px; }
 .page-canvas h2.blk-heading{ font-size: 25px; }

@@ -1,8 +1,17 @@
+// force un rechargement complet si la page est restaurée depuis le cache
+// arrière du navigateur (bfcache) — sans ça, un retour en arrière depuis un
+// autre outil peut réafficher un état JS/DOM figé au moment du départ,
+// potentiellement très en retard sur ce que le serveur sert réellement
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) location.reload();
+});
+
 // le thème est partagé par tout le projet (un site = un habillage cohérent) ;
 // seuls les blocs diffèrent d'une page à l'autre — voir getBlocks/setBlocks
 let state = {
   name: 'Sans titre',
   theme: THEMES[0].id,
+  customThemeVars: null, // palette ThemeForge importée pour ce projet, si theme === 'custom'
   pages: [{ name: 'Page 1', blocks: [] }],
   currentPageIndex: 0,
   selectedId: null,
@@ -27,13 +36,19 @@ function setBlocks(arr) {
 let historyStack = [];
 let historyIndex = -1;
 let restoringHistory = false;
+// reflète l'historique, pas un diff exact avec la dernière sauvegarde : un
+// undo() qui revient exactement à l'état sauvegardé remettrait quand même ce
+// drapeau à vrai — imprécision acceptée, plus simple qu'un vrai suivi de
+// "dirty" et le pire cas est juste un avertissement beforeunload superflu
+let hasUnsavedChanges = false;
 // vrai pendant un glisser (déplacement/redimensionnement) : bloque les
 // raccourcis clavier pour éviter toute interférence avec le geste en cours
 let gestureActive = false;
-// presse-papiers interne (copier/couper/coller de blocs) — pasteCount permet
-// à des collages répétés de décaler chaque copie plutôt que de les empiler
-// exactement au même endroit
-let clipboardBlock = null;
+// presse-papiers interne (copier/couper/coller de blocs) — toujours un
+// tableau (même pour un seul bloc) pour que la sélection multiple s'y
+// comporte comme la simple ; pasteCount permet à des collages répétés de
+// décaler chaque copie plutôt que de les empiler exactement au même endroit
+let clipboardBlocks = [];
 let pasteCount = 0;
 // sélection multiple (Maj+clic) : ids en plus de state.selectedId, qui reste
 // le "dernier cliqué" — voir toggleMultiSelect/renderMultiSelectProps
@@ -256,7 +271,11 @@ function renderPalette() {
 }
 
 function renderThemeSelect() {
-  themeSelectEl.innerHTML = THEMES.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  // l'option "Personnalisé" n'existe que si une palette ThemeForge a été
+  // importée pour ce projet — jamais affichée pour un projet qui n'en a pas
+  const customOption = state.customThemeVars
+    ? `<option value="custom">Personnalisé (ThemeForge)</option>` : '';
+  themeSelectEl.innerHTML = THEMES.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('') + customOption;
   themeSelectEl.value = state.theme;
 }
 
@@ -333,7 +352,7 @@ function reorderLayer(draggedId, targetId) {
 }
 
 function renderCanvas() {
-  applyTheme(canvasEl, state.theme);
+  applyTheme(canvasEl, state.theme, state.customThemeVars);
   const blocks = getBlocks();
   canvasHintEl.style.display = blocks.length ? 'none' : 'block';
 
@@ -416,20 +435,32 @@ function positionOverlays(wrapper) {
   }
 }
 
-// agrandit le canevas pour qu'il contienne toujours tous les blocs, quelle
-// que soit leur position (mesuré, pas déduit de block.height qui peut être
-// 'auto') — les blocs fixés sont exclus : leur hauteur épouse déjà celle du
-// canevas (top:0;bottom:0), les mesurer ferait grandir le canevas sans fin
-function updateCanvasHeight() {
+// calcule la hauteur nécessaire en ignorant les blocs dont l'id est dans
+// excludeIds — pendant un glisser/redimensionnement, l'appelant exclut le(s)
+// bloc(s) en cours de déplacement pour les mesurer à part à chaque frame
+// (déjà mesurés pour l'aimantation, pas de lecture supplémentaire) plutôt
+// que de rescanner tous les blocs du canevas à chaque mousemove — voir
+// startMove/startResize, seul updateCanvasHeight() fait le scan complet
+function computeStaticMaxBottom(excludeIds) {
+  const exclude = new Set(excludeIds);
   let maxBottom = 400;
   canvasEl.querySelectorAll('.block-wrapper').forEach(w => {
+    if (exclude.has(w.dataset.id)) return;
     const block = findBlock(w.dataset.id);
     if (block && isPinnedBlock(block)) return;
     const content = w.querySelector('.blk-resizable');
     if (!content) return;
     maxBottom = Math.max(maxBottom, content.offsetTop + content.offsetHeight + 60);
   });
-  canvasEl.style.minHeight = maxBottom + 'px';
+  return maxBottom;
+}
+
+// agrandit le canevas pour qu'il contienne toujours tous les blocs, quelle
+// que soit leur position (mesuré, pas déduit de block.height qui peut être
+// 'auto') — les blocs fixés sont exclus : leur hauteur épouse déjà celle du
+// canevas (top:0;bottom:0), les mesurer ferait grandir le canevas sans fin
+function updateCanvasHeight() {
+  canvasEl.style.minHeight = computeStaticMaxBottom([]) + 'px';
 }
 
 // glisser le corps d'un bloc le déplace n'importe où sur le canevas ; un
@@ -449,6 +480,9 @@ function startMove(e, id, isGroup) {
   const starts = movable.map(b => ({ id: b.id, x: b.x, y: b.y }));
   const startX = e.clientX;
   const startY = e.clientY;
+  // hauteur des blocs qui ne bougent pas pendant ce geste, calculée une
+  // seule fois plutôt qu'à chaque mousemove (voir computeStaticMaxBottom)
+  const staticMaxBottom = computeStaticMaxBottom(movable.map(b => b.id));
 
   // l'aimantation ne s'applique qu'au déplacement d'un seul bloc : en groupe,
   // comparer chaque bloc à tous les autres (y compris ceux du même groupe,
@@ -461,6 +495,7 @@ function startMove(e, id, isGroup) {
   function onMove(ev) {
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
+    let movingMaxBottom = 0;
 
     if (single) {
       const candX = Math.max(0, starts[0].x + dx);
@@ -484,6 +519,7 @@ function startMove(e, id, isGroup) {
       content.style.top = block.y + 'px';
       positionOverlays(wrapper);
       updateSnapGuides(xMatch ? xMatch.target : null, yMatch ? yMatch.target : null);
+      movingMaxBottom = content.offsetTop + content.offsetHeight + 60;
     } else {
       starts.forEach(s => {
         const b = findBlock(s.id);
@@ -495,9 +531,10 @@ function startMove(e, id, isGroup) {
         const c = w.querySelector('.blk-resizable');
         if (c) { c.style.left = b.x + 'px'; c.style.top = b.y + 'px'; }
         positionOverlays(w);
+        if (c) movingMaxBottom = Math.max(movingMaxBottom, c.offsetTop + c.offsetHeight + 60);
       });
     }
-    updateCanvasHeight();
+    canvasEl.style.minHeight = Math.max(staticMaxBottom, movingMaxBottom) + 'px';
   }
 
   function onUp() {
@@ -506,6 +543,7 @@ function startMove(e, id, isGroup) {
     window.removeEventListener('blur', onUp);
     hideSnapGuides();
     gestureActive = false;
+    updateCanvasHeight(); // recalcul complet en filet de sécurité, une seule fois
     pushHistory();
   }
 
@@ -535,6 +573,9 @@ function startResize(e, id, dir) {
   const startTop = block.y;
   // un seul bord bouge par poignée, pas besoin de comparer gauche/centre/droite
   const snapTargets = computeSnapTargets(id);
+  // hauteur des autres blocs, calculée une seule fois plutôt qu'à chaque
+  // mousemove (voir computeStaticMaxBottom, même principe que startMove)
+  const staticMaxBottom = computeStaticMaxBottom([id]);
 
   function onMove(ev) {
     const dx = ev.clientX - startX;
@@ -564,7 +605,7 @@ function startResize(e, id, dir) {
       block.y = finalTop;
       updateSnapGuides(null, snapped);
     }
-    updateBlockDom(id);
+    updateBlockDom(id, staticMaxBottom);
     syncSizeFields(block);
   }
 
@@ -574,6 +615,7 @@ function startResize(e, id, dir) {
     window.removeEventListener('blur', onUp);
     hideSnapGuides();
     gestureActive = false;
+    updateCanvasHeight(); // recalcul complet en filet de sécurité, une seule fois
     pushHistory();
   }
 
@@ -582,51 +624,81 @@ function startResize(e, id, dir) {
   window.addEventListener('blur', onUp);
 }
 
-// copie un bloc (tous ses réglages) juste après l'original dans state.blocks
-// — pas en fin de tableau, sinon il saute visuellement au-dessus de tous les
-// autres blocs (l'ordre du tableau pilote l'empilement, voir bringToFront)
-function duplicateBlock(id) {
-  const block = findBlock(id);
-  if (!block) return;
-  const [copy] = cloneBlocks([block]);
-  copy.id = makeBlockId();
-  copy.x = Math.max(0, block.x + DUPLICATE_OFFSET);
-  copy.y = Math.max(0, block.y + DUPLICATE_OFFSET);
+// duplique un ou plusieurs blocs d'un coup — un seul pushHistory()/render()
+// pour tout le groupe (comme deleteBlocks), pas un par bloc. Chaque copie va
+// juste après son original dans state.blocks, pas en fin de tableau, sinon
+// elle saute visuellement au-dessus de tous les autres blocs (l'ordre du
+// tableau pilote l'empilement, voir bringToFront) ; l'ordre de traitement
+// des ids n'affecte pas le résultat puisque l'index d'insertion de chacun
+// est relu à chaque itération (jamais mis en cache avant les autres splice)
+function duplicateBlocks(ids) {
   const blocks = getBlocks();
-  const idx = blocks.findIndex(b => b.id === id);
-  blocks.splice(idx + 1, 0, copy);
-  state.selectedId = copy.id;
+  const newIds = [];
+  ids.forEach(id => {
+    const block = findBlock(id);
+    if (!block) return;
+    const [copy] = cloneBlocks([block]);
+    copy.id = makeBlockId();
+    copy.x = Math.max(0, block.x + DUPLICATE_OFFSET);
+    copy.y = Math.max(0, block.y + DUPLICATE_OFFSET);
+    const idx = blocks.findIndex(b => b.id === id);
+    blocks.splice(idx + 1, 0, copy);
+    newIds.push(copy.id);
+  });
+  if (!newIds.length) return;
+  multiSelectIds.clear();
+  if (newIds.length > 1) newIds.forEach(nid => multiSelectIds.add(nid));
+  state.selectedId = newIds[newIds.length - 1];
   pushHistory();
   render();
 }
 
+function duplicateBlock(id) {
+  duplicateBlocks([id]);
+}
+
 // ---------- Copier / Couper / Coller ----------
 
+// ids visés par une action "sur la sélection courante" (copier/couper au
+// clavier) : le groupe multi-sélectionné s'il y en a un, sinon le seul bloc
+// sélectionné, sinon rien — même hiérarchie que Suppr (deleteBlocks)
+function resolveSelectionIds() {
+  if (multiSelectIds.size > 1) return [...multiSelectIds];
+  return state.selectedId ? [state.selectedId] : [];
+}
+
 function copySelected() {
-  if (!state.selectedId) return;
-  const block = findBlock(state.selectedId);
-  if (!block) return;
-  clipboardBlock = cloneBlocks([block])[0];
+  const ids = resolveSelectionIds();
+  if (!ids.length) return;
+  clipboardBlocks = cloneBlocks(ids.map(findBlock).filter(Boolean));
   pasteCount = 0;
 }
 
 function cutSelected() {
-  if (!state.selectedId) return;
+  const ids = resolveSelectionIds();
+  if (!ids.length) return;
   copySelected();
-  deleteBlock(state.selectedId);
+  deleteBlocks(ids);
 }
 
-// colle le bloc copié, décalé un peu plus à chaque collage successif
-// (cascade) plutôt que de toujours superposer la copie au même endroit
+// colle les blocs copiés, décalés un peu plus à chaque collage successif
+// (cascade) plutôt que de toujours superposer les copies au même endroit ;
+// sélectionne le groupe collé, comme un duplicata
 function pasteClipboard() {
-  if (!clipboardBlock) return;
+  if (!clipboardBlocks.length) return;
   pasteCount++;
-  const [copy] = cloneBlocks([clipboardBlock]);
-  copy.id = makeBlockId();
-  copy.x = Math.max(0, clipboardBlock.x + DUPLICATE_OFFSET * pasteCount);
-  copy.y = Math.max(0, clipboardBlock.y + DUPLICATE_OFFSET * pasteCount);
-  getBlocks().push(copy);
-  state.selectedId = copy.id;
+  const newIds = [];
+  clipboardBlocks.forEach(original => {
+    const [copy] = cloneBlocks([original]);
+    copy.id = makeBlockId();
+    copy.x = Math.max(0, original.x + DUPLICATE_OFFSET * pasteCount);
+    copy.y = Math.max(0, original.y + DUPLICATE_OFFSET * pasteCount);
+    getBlocks().push(copy);
+    newIds.push(copy.id);
+  });
+  multiSelectIds.clear();
+  if (newIds.length > 1) newIds.forEach(nid => multiSelectIds.add(nid));
+  state.selectedId = newIds[newIds.length - 1];
   pushHistory();
   render();
 }
@@ -760,7 +832,11 @@ function deleteBlock(id) {
 
 // remplace uniquement le contenu rendu d'un bloc (garde le panneau de
 // propriétés et son focus intacts pendant la frappe)
-function updateBlockDom(id) {
+// staticMaxBottom (optionnel) : hauteur déjà calculée pour tous les autres
+// blocs par l'appelant (startResize, pendant un geste) — évite un scan
+// complet du canevas à chaque frame ; omis (recalcul complet) pour tous les
+// autres appels, bien plus rares que le mousemove d'un redimensionnement
+function updateBlockDom(id, staticMaxBottom) {
   const wrapper = canvasEl.querySelector(`.block-wrapper[data-id="${id}"]`);
   if (!wrapper) return;
   const frame = wrapper.querySelector('.selection-frame');
@@ -772,7 +848,14 @@ function updateBlockDom(id) {
   const block = findBlock(id);
   wrapper.insertAdjacentHTML('beforeend', renderBlockContent(block, blocks));
   positionOverlays(wrapper);
-  updateCanvasHeight();
+
+  if (staticMaxBottom != null) {
+    const content = wrapper.querySelector('.blk-resizable');
+    const ownBottom = content ? content.offsetTop + content.offsetHeight + 60 : 0;
+    canvasEl.style.minHeight = Math.max(staticMaxBottom, ownBottom) + 'px';
+  } else {
+    updateCanvasHeight();
+  }
 
   // une navbar/footer fixé détermine la hauteur disponible pour une barre
   // latérale fixée (voir computePinOffsets dans blocks.js) : si c'est elle
@@ -1444,6 +1527,7 @@ function snapshot() {
 function initHistory() {
   historyStack = [snapshot()];
   historyIndex = 0;
+  hasUnsavedChanges = false;
   updateHistoryButtons();
 }
 
@@ -1461,6 +1545,7 @@ function pushHistory() {
   historyStack.push(entry);
   if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
   historyIndex = historyStack.length - 1;
+  hasUnsavedChanges = true;
   updateHistoryButtons();
 }
 
@@ -1470,6 +1555,7 @@ function applyHistorySnapshot(entry) {
   state.selectedId = entry.selectedId;
   render();
   restoringHistory = false;
+  hasUnsavedChanges = true;
   updateHistoryButtons();
 }
 
@@ -1608,22 +1694,23 @@ function onGlobalKeydown(e) {
   }
   if (ctrlOrCmd && (e.key === 'c' || e.key === 'C')) {
     if (isTypingInField()) return; // laisse le copier natif du navigateur agir dans le champ
-    if (state.selectedId) { e.preventDefault(); copySelected(); }
+    if (multiSelectIds.size > 1 || state.selectedId) { e.preventDefault(); copySelected(); }
     return;
   }
   if (ctrlOrCmd && (e.key === 'x' || e.key === 'X')) {
     if (isTypingInField()) return;
-    if (state.selectedId) { e.preventDefault(); cutSelected(); }
+    if (multiSelectIds.size > 1 || state.selectedId) { e.preventDefault(); cutSelected(); }
     return;
   }
   if (ctrlOrCmd && (e.key === 'v' || e.key === 'V')) {
     if (isTypingInField()) return; // laisse le coller natif du navigateur agir dans le champ
-    if (clipboardBlock) { e.preventDefault(); pasteClipboard(); }
+    if (clipboardBlocks.length) { e.preventDefault(); pasteClipboard(); }
     return;
   }
   if (ctrlOrCmd && (e.key === 'd' || e.key === 'D')) {
     if (isTypingInField()) return;
-    if (state.selectedId) { e.preventDefault(); duplicateBlock(state.selectedId); }
+    if (multiSelectIds.size > 1) { e.preventDefault(); duplicateBlocks([...multiSelectIds]); }
+    else if (state.selectedId) { e.preventDefault(); duplicateBlock(state.selectedId); }
     return;
   }
 
@@ -1766,70 +1853,147 @@ function deletePage(index) {
 
 themeSelectEl.addEventListener('change', () => {
   state.theme = themeSelectEl.value;
-  applyTheme(canvasEl, state.theme);
+  applyTheme(canvasEl, state.theme, state.customThemeVars);
+});
+
+// ---------- Intégration ThemeForge (thème personnalisé) ----------
+
+let themeforgePalettes = [];
+const themeforgePaletteSelectEl = document.getElementById('themeforgePaletteSelect');
+
+async function refreshThemeForgePalettes() {
+  const res = await fetch('api/themeforge/palettes');
+  themeforgePalettes = await res.json();
+  themeforgePaletteSelectEl.innerHTML = '<option value="">🎨 ThemeForge…</option>'
+    + themeforgePalettes.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
+}
+
+// ne réutilise que la couleur d'accent + panneau/bordure de la palette —
+// fond/texte/police restent ceux du thème clair, sûrs et lisibles quelle
+// que soit la palette importée (une palette ThemeForge n'a pas de notion
+// de rôle fond/texte, seulement une liste de couleurs)
+function themeVarsFromPalette(palette) {
+  const base = getTheme('minimal-light').vars;
+  return {
+    ...base,
+    accent: palette.colors[0] || base.accent,
+    panel: palette.colors[1] || base.panel,
+    border: palette.colors[2] || base.border,
+  };
+}
+
+themeforgePaletteSelectEl.addEventListener('change', () => {
+  const palette = themeforgePalettes.find(p => p.id === themeforgePaletteSelectEl.value);
+  if (!palette) return;
+  state.customThemeVars = themeVarsFromPalette(palette);
+  state.theme = 'custom';
+  renderThemeSelect();
+  applyTheme(canvasEl, state.theme, state.customThemeVars);
+  themeforgePaletteSelectEl.value = '';
 });
 
 projectNameEl.addEventListener('input', () => { state.name = projectNameEl.value; });
 
 async function refreshLoadList() {
-  const res = await fetch('/api/projects');
+  // chemin relatif (pas de `/` initial) : la page peut être servie à la
+  // racine (localhost:4000/) ou sous un préfixe via le proxy du hub
+  // (localhost:8080/sitebuilder/) — un chemin absolu irait taper la racine
+  // du hub lui-même en ignorant ce préfixe
+  const res = await fetch('api/projects');
   const list = await res.json();
   loadSelectEl.innerHTML = '<option value="">Charger…</option>'
     + list.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
 }
 
-loadSelectEl.addEventListener('change', async () => {
+// le backend expose déjà DELETE /api/projects/:name (server.js) — jusqu'ici
+// rien dans l'interface ne l'appelait, aucun moyen de supprimer un projet
+document.getElementById('deleteProjectBtn').addEventListener('click', async () => {
   const name = loadSelectEl.value;
   if (!name) return;
-  const res = await fetch(`/api/projects/${encodeURIComponent(name)}`);
-  if (!res.ok) { alert('Impossible de charger ce projet.'); return; }
+  if (!confirm(`Supprimer définitivement le projet « ${name} » ?`)) return;
+  const res = await fetch(`api/projects/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  if (!res.ok) { alert('Échec de la suppression.'); return; }
+  await refreshLoadList();
+});
+
+// factorisé pour être appelable à la fois depuis le sélecteur et depuis le
+// lien direct ?project= (venant du hub) au chargement de la page
+async function loadProjectByName(name) {
+  const res = await fetch(`api/projects/${encodeURIComponent(name)}`);
+  if (!res.ok) { alert('Impossible de charger ce projet.'); return false; }
   const project = await res.json();
   // rétrocompatibilité : les projets enregistrés avant les pages multiples
   // n'ont qu'un tableau "blocks" — on le convertit en une seule page
   const pages = Array.isArray(project.pages) && project.pages.length
     ? project.pages
     : [{ name: 'Page 1', blocks: project.blocks || [] }];
-  state = { name: project.name, theme: project.theme, pages, currentPageIndex: 0, selectedId: null };
+  state = {
+    name: project.name,
+    theme: project.theme,
+    customThemeVars: project.customThemeVars || null,
+    pages,
+    currentPageIndex: 0,
+    selectedId: null,
+  };
   projectNameEl.value = state.name;
-  themeSelectEl.value = state.theme;
+  renderThemeSelect();
   render();
   renderPagesBar();
   // charger un autre projet ne doit pas permettre d'annuler vers les blocs
   // du projet précédent — historique repart de zéro sur ce nouvel état
   initHistory();
+  return true;
+}
+
+loadSelectEl.addEventListener('change', async () => {
+  const name = loadSelectEl.value;
+  if (!name) return;
+  await loadProjectByName(name);
 });
 
 document.getElementById('saveBtn').addEventListener('click', async () => {
   const name = projectNameEl.value.trim();
   if (!name) { alert("Donnez un nom au projet avant d'enregistrer."); return; }
   state.name = name;
-  const res = await fetch(`/api/projects/${encodeURIComponent(name)}`, {
+  const res = await fetch(`api/projects/${encodeURIComponent(name)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ theme: state.theme, pages: state.pages }),
+    body: JSON.stringify({ theme: state.theme, customThemeVars: state.customThemeVars, pages: state.pages }),
   });
   if (!res.ok) { alert("Échec de l'enregistrement."); return; }
+  hasUnsavedChanges = false;
   await refreshLoadList();
 });
 
-// exporte uniquement la page actuellement affichée (pas tout le projet) —
-// un fichier HTML par page, à exporter une par une si le projet en a plusieurs
-document.getElementById('exportBtn').addEventListener('click', () => {
-  const theme = getTheme(state.theme);
-  const varsCss = ':root{' + Object.entries(theme.vars).map(([k, v]) => `--page-${k}: ${v};`).join(' ') + '}';
-  const pageBlocks = getBlocks();
-  const blocksHtml = pageBlocks.map(b => renderBlockContent(b, pageBlocks)).join('\n');
-  const pageName = state.pages[state.currentPageIndex].name;
-  const fontImport = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700&family=Playfair+Display:wght@600;700&family=Space+Grotesk:wght@500;700&family=Pacifico&display=swap');";
+// avertit avant de fermer/recharger l'onglet ou de suivre un lien (dont
+// "← Hub") s'il reste des modifications non enregistrées — historyStack
+// n'est vidé/remis à false qu'à l'initialisation et après une sauvegarde
+// réussie (voir initHistory/pushHistory/le handler saveBtn ci-dessus)
+window.addEventListener('beforeunload', (e) => {
+  if (!hasUnsavedChanges) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
 
-  const html = `<!DOCTYPE html>
+const FONT_IMPORT_CSS = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700&family=Playfair+Display:wght@600;700&family=Space+Grotesk:wght@500;700&family=Pacifico&display=swap');";
+
+// construit le HTML autonome d'UNE page donnée (pas forcément la page
+// actuellement affichée) — factorisé pour être réutilisé par l'export d'une
+// seule page et par l'export du site complet, qui doivent produire un
+// résultat identique à ce que montre l'aperçu (mêmes fonctions de rendu)
+function pageToHtml(page) {
+  const theme = getTheme(state.theme, state.customThemeVars);
+  const varsCss = ':root{' + Object.entries(theme.vars).map(([k, v]) => `--page-${k}: ${v};`).join(' ') + '}';
+  const blocksHtml = page.blocks.map(b => renderBlockContent(b, page.blocks)).join('\n');
+
+  return `<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${escapeHtml(state.name)} — ${escapeHtml(pageName)}</title>
+<title>${escapeHtml(state.name)} — ${escapeHtml(page.name)}</title>
 <style>
-${fontImport}
+${FONT_IMPORT_CSS}
 ${varsCss}
 ${PAGE_CSS}
 </style>
@@ -1841,15 +2005,36 @@ ${blocksHtml}
 </body>
 </html>
 `;
+}
 
+function pageSlug(page) {
+  return `${state.name}-${page.name}`.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'page';
+}
+
+function downloadHtml(filename, html) {
   const blob = new Blob([html], { type: 'text/html' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const slug = `${state.name}-${pageName}`.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
-  a.download = `${slug || 'page'}.html`;
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// exporte uniquement la page actuellement affichée (pas tout le projet) —
+// un fichier HTML par page, à exporter une par une si le projet en a plusieurs
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const page = state.pages[state.currentPageIndex];
+  downloadHtml(`${pageSlug(page)}.html`, pageToHtml(page));
+});
+
+// exporte toutes les pages du projet en une fois — un fichier HTML par page
+// (pas de bibliothèque zip disponible, vanilla JS sans dépendance), chacun
+// autonome et identique à ce que produirait l'export page par page
+document.getElementById('exportAllBtn').addEventListener('click', () => {
+  state.pages.forEach((page) => {
+    downloadHtml(`${pageSlug(page)}.html`, pageToHtml(page));
+  });
 });
 
 // ---------- Démarrage ----------
@@ -1873,15 +2058,31 @@ if (paletteSearchEl) {
   console.error('élément introuvable : paletteSearch');
 }
 
-function init() {
+async function init() {
   injectPageCss();
   renderPalette();
   renderThemeSelect();
   renderShortcutsList();
-  refreshLoadList();
+  await refreshLoadList();
+  await refreshThemeForgePalettes();
   render();
   renderPagesBar();
   initHistory();
+
+  // lien direct depuis le hub (?project=<nom>) : ouvre ce projet directement
+  // au lieu de rester sur un projet vierge ; absent ou invalide → comportement
+  // par défaut inchangé (vérifié contre la liste tout juste rafraîchie, pour
+  // ne jamais déclencher l'alerte d'erreur de loadProjectByName sur un lien
+  // simplement périmé)
+  const deepLinkProject = new URLSearchParams(location.search).get('project');
+  const deepLinkExists = deepLinkProject
+    && [...loadSelectEl.options].some((o) => o.value === deepLinkProject);
+  if (deepLinkExists) {
+    await loadProjectByName(deepLinkProject);
+    loadSelectEl.value = deepLinkProject;
+  }
 }
 
-init();
+// exposé pour le harnais de vérification (jsdom), qui peut ainsi attendre la
+// fin du premier chargement au lieu de deviner un délai
+window.__ready = init();

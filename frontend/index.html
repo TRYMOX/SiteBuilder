@@ -19,11 +19,16 @@
   <div class="sb-topbar-right">
     <button type="button" id="shortcutsBtn" class="sb-btn" title="Voir les raccourcis clavier">⌨ Raccourcis</button>
     <select id="themeSelect" class="sb-select" aria-label="Thème de design"></select>
+    <select id="themeforgePaletteSelect" class="sb-select" aria-label="Importer un thème depuis ThemeForge" title="Importer une palette ThemeForge comme thème personnalisé">
+      <option value="">🎨 ThemeForge…</option>
+    </select>
     <select id="loadSelect" class="sb-select" aria-label="Charger un projet sauvegardé">
       <option value="">Charger…</option>
     </select>
+    <button type="button" id="deleteProjectBtn" class="sb-btn sb-btn-icon" title="Supprimer le projet sélectionné">🗑</button>
     <button type="button" id="saveBtn" class="sb-btn">Enregistrer</button>
-    <button type="button" id="exportBtn" class="sb-btn sb-btn-accent">Exporter HTML</button>
+    <button type="button" id="exportBtn" class="sb-btn sb-btn-accent" title="Exporte uniquement la page affichée">Exporter HTML</button>
+    <button type="button" id="exportAllBtn" class="sb-btn" title="Exporte toutes les pages du projet, un fichier par page">Exporter tout le site</button>
   </div>
 </header>
 

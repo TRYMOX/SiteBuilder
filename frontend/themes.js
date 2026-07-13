@@ -184,15 +184,18 @@ const THEMES = [
   },
 ];
 
-function getTheme(id) {
+// id 'custom' n'est pas un thème de la liste statique : c'est une palette
+// ThemeForge importée, propre au projet en cours (stockée sur state, pas ici)
+function getTheme(id, customVars) {
+  if (id === 'custom' && customVars) return { id: 'custom', name: 'Personnalisé (ThemeForge)', vars: customVars };
   return THEMES.find(t => t.id === id) || THEMES[0];
 }
 
 // applique un thème aux variables CSS de l'élément cible (le canevas
 // d'édition et le document exporté utilisent tous deux cette même fonction,
 // pour qu'export = ce que montre l'aperçu)
-function applyTheme(el, themeId) {
-  const theme = getTheme(themeId);
+function applyTheme(el, themeId, customVars) {
+  const theme = getTheme(themeId, customVars);
   for (const [key, value] of Object.entries(theme.vars)) {
     el.style.setProperty(`--page-${key}`, value);
   }
